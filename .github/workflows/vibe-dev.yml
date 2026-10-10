@@ -477,22 +477,28 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          TOOLS=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -1)
+          TOOLS=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit)
           [ -n "$TOOLS" ] || { echo "sdkmanager not found under $ANDROID_HOME"; exit 1; }
           export PATH="$(dirname "$TOOLS"):$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           IMAGE=$(find "$ANDROID_HOME/system-images" -type d -path '*/google_apis/x86_64' 2>/dev/null | sort | tail -1 || true)
           if [ -z "${IMAGE:-}" ]; then
             echo "Installing the Android ${ANDROID_API} emulator image"
+            # sdkmanager closes stdin when it finishes, so `yes` dies with SIGPIPE.
+            # pipefail would turn that into a failed step after a successful install.
+            set +o pipefail
             yes | sdkmanager --licenses >/dev/null || true
             yes | sdkmanager --install "platform-tools" "platforms;android-${ANDROID_API}" "emulator" "system-images;android-${ANDROID_API};google_apis;x86_64"
+            set -o pipefail
             IMAGE="$ANDROID_HOME/system-images/android-${ANDROID_API}/google_apis/x86_64"
           fi
           echo "Using system image $IMAGE"
           API=$(basename "$(dirname "$(dirname "$IMAGE")")")
           API=${API#android-}
           PKG="system-images;android-${API};google_apis;x86_64"
+          set +o pipefail
           echo no | avdmanager create avd -n vibe -k "$PKG" -d pixel_7 --force \
             || echo no | avdmanager create avd -n vibe -k "$PKG" --force
+          set -o pipefail
           nohup emulator -avd vibe -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot > "$RUNNER_TEMP/emulator.log" 2>&1 &
           adb wait-for-device
           for i in $(seq 1 120); do
