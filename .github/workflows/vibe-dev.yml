@@ -220,11 +220,10 @@ jobs:
           curl -fsSL --retry 5 -o "$RUNNER_TEMP/versions.json" https://exp.host/--/api/v2/versions
           URL=$(node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync("package.json","utf8")); const major=(String((pkg.dependencies||{}).expo||"54").match(/\d+/)||["54"])[0]; const all=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/versions.json","utf8")); const keys=Object.keys(all.sdkVersions||{}).filter((k)=>k.startsWith(major+".")).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})); const entry=all.sdkVersions[keys.at(-1)]; if(!entry||!entry.iosClientUrl){console.error("no Expo Go build for SDK "+major); process.exit(1);} process.stdout.write(entry.iosClientUrl);')
           curl -fsSL --retry 5 -o "$RUNNER_TEMP/expogo.tar.gz" "$URL"
-          rm -rf "$RUNNER_TEMP/expogo" && mkdir -p "$RUNNER_TEMP/expogo"
-          tar -xzf "$RUNNER_TEMP/expogo.tar.gz" -C "$RUNNER_TEMP/expogo"
-          APP=$(find "$RUNNER_TEMP/expogo" -name '*.app' | head -1)
-          [ -n "$APP" ] || { echo "Expo Go archive had no .app"; exit 1; }
-          xcrun simctl install "$UDID" "$APP"
+          rm -rf "$RUNNER_TEMP/Expo Go.app"
+          mkdir -p "$RUNNER_TEMP/Expo Go.app"
+          tar -xzf "$RUNNER_TEMP/expogo.tar.gz" -C "$RUNNER_TEMP/Expo Go.app"
+          xcrun simctl install "$UDID" "$RUNNER_TEMP/Expo Go.app"
           xcrun simctl launch "$UDID" host.exp.Exponent || true
           [ -n "$DEV_URL" ] || { echo "DEV_URL missing from the session secret"; exit 1; }
           xcrun simctl openurl "$UDID" "$DEV_URL"
