@@ -1,10 +1,12 @@
-# vibe-native-template-version: 5
+# vibe-native-template-version: 6
 # Boots a simulator or emulator and streams it until the hold loop ends.
 # Default mode is Expo Go: no native compile, JavaScript comes from the local
 # Metro tunnel. Pass mode=dev-client only when the app has custom native code.
 # Expo Go does not use a container. GitHub's macOS image already has the
 # simulator, and a Linux container would not get /dev/kvm. Android reuses a
 # cached emulator snapshot instead of installing and cold-booting every time.
+# iOS downloads and cache restores start only after the simulator is booted.
+# Doing them during boot took 151s instead of 75s, and Expo Go was still late.
 # The tunnel URL is a commit status so the CLI can read it while the job is
 # still running. The gate token lives in VIBE_SESSION_KEYS, never in a workflow input.
 name: vibe-dev
@@ -91,13 +93,6 @@ jobs:
           EOF
           nohup bash "$RUNNER_TEMP/boot-sim.sh" "$DEVICE" > "$RUNNER_TEMP/boot-sim.log" 2>&1 &
 
-      - name: Restore stream tools
-        id: tools
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.vibe-native/ios-tools
-          key: vibe-ios-tools-serve-sim-0.1.47
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -161,13 +156,43 @@ jobs:
           path: ${{ inputs.project_dir }}/build/vibe-app
           key: vibe-app-${{ runner.os }}-expo-${{ inputs.project_dir }}-Debug-${{ steps.fp.outputs.hash }}
 
-      - name: Fetch Expo Go tools during simulator boot
+      - name: Boot simulator
+        id: sim
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 240); do
+            [ -f "$RUNNER_TEMP/sim.ready" ] && break
+            sleep 1
+          done
+          if [ ! -f "$RUNNER_TEMP/sim.ready" ]; then
+            echo "Simulator boot failed" >&2
+            cat "$RUNNER_TEMP/boot-sim.log" >&2 || true
+            exit 1
+          fi
+          UDID=$(cat "$RUNNER_TEMP/udid")
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          echo "VIBE_DEVICES_JSON=$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/devices.json","utf8")); const names=[]; for (const rt of Object.values(j.devices||{})) for (const d of rt) if (d.isAvailable) names.push(d.name); process.stdout.write(JSON.stringify(names.slice(0,40)))')" >> "$GITHUB_ENV" || true
+
+      - name: Restore stream tools
+        id: tools
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.vibe-native/ios-tools
+          key: vibe-ios-tools-serve-sim-0.1.47
+
+      - name: Restore Expo Go
+        id: expogo
+        if: inputs.mode != 'dev-client'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.vibe-native/expo-go
+          key: vibe-ios-expogo-${{ runner.os }}-v1
+
+      - name: Prepare stream tools
         env:
           VIBE_MODE: ${{ inputs.mode }}
           VIBE_PROJECT_DIR: ${{ inputs.project_dir }}
         run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/fetch-ios-tools.sh" <<'EOF'
           set -euo pipefail
           TOOLS="$HOME/.vibe-native/ios-tools"
           mkdir -p "$TOOLS"
@@ -194,6 +219,12 @@ jobs:
           if [ "$VIBE_MODE" = "dev-client" ]; then
             exit 0
           fi
+          if [ -d "$HOME/.vibe-native/expo-go/Expo Go.app" ]; then
+            rm -rf "$RUNNER_TEMP/Expo Go.app"
+            cp -R "$HOME/.vibe-native/expo-go/Expo Go.app" "$RUNNER_TEMP/Expo Go.app"
+            touch "$RUNNER_TEMP/expogo.ready"
+            exit 0
+          fi
           cd "$GITHUB_WORKSPACE/$VIBE_PROJECT_DIR"
           curl -fsSL --retry 5 -o "$RUNNER_TEMP/versions.json" https://exp.host/--/api/v2/versions
           URL=$(node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync("package.json","utf8")); const major=(String((pkg.dependencies||{}).expo||"54").match(/\d+/)||["54"])[0]; const all=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/versions.json","utf8")); const keys=Object.keys(all.sdkVersions||{}).filter((k)=>k.startsWith(major+".")).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})); const entry=all.sdkVersions[keys.at(-1)]; if(!entry||!entry.iosClientUrl){console.error("no Expo Go build for SDK "+major); process.exit(1);} process.stdout.write(entry.iosClientUrl);')
@@ -201,26 +232,10 @@ jobs:
           rm -rf "$RUNNER_TEMP/Expo Go.app"
           mkdir -p "$RUNNER_TEMP/Expo Go.app"
           tar -xzf "$RUNNER_TEMP/expogo.tar.gz" -C "$RUNNER_TEMP/Expo Go.app"
+          mkdir -p "$HOME/.vibe-native/expo-go"
+          rm -rf "$HOME/.vibe-native/expo-go/Expo Go.app"
+          cp -R "$RUNNER_TEMP/Expo Go.app" "$HOME/.vibe-native/expo-go/Expo Go.app"
           touch "$RUNNER_TEMP/expogo.ready"
-          EOF
-          nohup bash "$RUNNER_TEMP/fetch-ios-tools.sh" > "$RUNNER_TEMP/fetch-ios-tools.log" 2>&1 &
-
-      - name: Boot simulator
-        id: sim
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 240); do
-            [ -f "$RUNNER_TEMP/sim.ready" ] && break
-            sleep 1
-          done
-          if [ ! -f "$RUNNER_TEMP/sim.ready" ]; then
-            echo "Simulator boot failed" >&2
-            cat "$RUNNER_TEMP/boot-sim.log" >&2 || true
-            exit 1
-          fi
-          UDID=$(cat "$RUNNER_TEMP/udid")
-          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-          echo "VIBE_DEVICES_JSON=$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/devices.json","utf8")); const names=[]; for (const rt of Object.values(j.devices||{})) for (const d of rt) if (d.isAvailable) names.push(d.name); process.stdout.write(JSON.stringify(names.slice(0,40)))')" >> "$GITHUB_ENV" || true
 
       - name: Start serve-sim
         env:
@@ -414,6 +429,14 @@ jobs:
         with:
           path: ~/.vibe-native/ios-tools
           key: vibe-ios-tools-serve-sim-0.1.47
+
+      - name: Save Expo Go
+        if: inputs.mode != 'dev-client' && steps.expogo.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.vibe-native/expo-go
+          key: vibe-ios-expogo-${{ runner.os }}-v1
 
       - name: Hold the stream open
         env:
@@ -719,12 +742,9 @@ jobs:
           if [ "$booted" != true ]; then
             nohup emulator -avd vibe "${OPTS[@]}" > "$RUNNER_TEMP/emulator.log" 2>&1 &
             wait_boot 180 || { tail -n 120 "$RUNNER_TEMP/emulator.log" || true; exit 1; }
-            if adb emu avd snapshot save vibe-ready; then
-              find "$ANDROID_AVD_HOME" -name '*.lock' -delete || true
-              echo "save=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "::warning::snapshot save failed; the next run will cold boot"
-            fi
+            # The snapshot file is written after the stream is up, so this cold
+            # boot is not longer than a boot that does not save anything.
+            echo "save=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Start Android stream
@@ -839,8 +859,18 @@ jobs:
           node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
             --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "agent-ready"
 
-      - name: Save emulator snapshot
+      - name: Write emulator snapshot
+        id: snap
         if: steps.boot.outputs.save == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          adb emu avd snapshot save vibe-ready
+          find "$HOME/.android/avd" -name '*.lock' -delete || true
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save emulator snapshot
+        if: steps.boot.outputs.save == 'true' && steps.snap.outputs.ok == 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:

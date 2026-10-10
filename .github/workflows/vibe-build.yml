@@ -1,4 +1,4 @@
-# vibe-native-template-version: 5
+# vibe-native-template-version: 6
 name: vibe-build
 run-name: vibe-build ${{ inputs.session }} · ${{ inputs.platform }} · ${{ inputs.profile }}
 

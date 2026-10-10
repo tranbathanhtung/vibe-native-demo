@@ -1,4 +1,4 @@
-# vibe-native-template-version: 5
+# vibe-native-template-version: 6
 name: vibe-release
 run-name: vibe-release ${{ inputs.session }} · ${{ inputs.platform }} · ${{ inputs.destination }}
 
