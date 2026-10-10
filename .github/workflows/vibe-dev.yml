@@ -1,4 +1,4 @@
-# vibe-native-template-version: 4
+# vibe-native-template-version: 5
 # Boots a simulator or emulator and streams it until the hold loop ends.
 # Default mode is Expo Go: no native compile, JavaScript comes from the local
 # Metro tunnel. Pass mode=dev-client only when the app has custom native code.
@@ -66,6 +66,38 @@ jobs:
       VIBE_RUNNER_VERSION: "0.1.0"
       BUILD_CONFIGURATION: Debug
     steps:
+      - name: Start the simulator before checkout
+        run: |
+          set -euo pipefail
+          DEVICE='${{ inputs.device }}'
+          [ -n "$DEVICE" ] || DEVICE="iPhone 17 Pro"
+          cat > "$RUNNER_TEMP/boot-sim.sh" <<'EOF'
+          set -euo pipefail
+          DEVICE="$1"
+          UDID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/' || true)
+          if [ -z "$UDID" ]; then
+            echo "$DEVICE is not on this image; using the newest iPhone"
+            UDID=$(xcrun simctl list devices available | grep -E '^\s+iPhone' | tail -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          fi
+          if [ -z "$UDID" ]; then
+            echo "No iOS simulator available"
+            exit 1
+          fi
+          echo "$UDID" > "$RUNNER_TEMP/udid"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json" || true
+          touch "$RUNNER_TEMP/sim.ready"
+          EOF
+          nohup bash "$RUNNER_TEMP/boot-sim.sh" "$DEVICE" > "$RUNNER_TEMP/boot-sim.log" 2>&1 &
+
+      - name: Restore stream tools
+        id: tools
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.vibe-native/ios-tools
+          key: vibe-ios-tools-serve-sim-0.1.47
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -137,12 +169,27 @@ jobs:
           set -euo pipefail
           cat > "$RUNNER_TEMP/fetch-ios-tools.sh" <<'EOF'
           set -euo pipefail
-          curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/cloudflared.tgz" \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
-          tar -xzf "$RUNNER_TEMP/cloudflared.tgz" -C "$RUNNER_TEMP"
-          chmod +x "$RUNNER_TEMP/cloudflared"
+          TOOLS="$HOME/.vibe-native/ios-tools"
+          mkdir -p "$TOOLS"
+          if [ -x "$TOOLS/cloudflared" ]; then
+            cp "$TOOLS/cloudflared" "$RUNNER_TEMP/cloudflared"
+            chmod +x "$RUNNER_TEMP/cloudflared"
+          else
+            curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/cloudflared.tgz" \
+              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+            tar -xzf "$RUNNER_TEMP/cloudflared.tgz" -C "$RUNNER_TEMP"
+            chmod +x "$RUNNER_TEMP/cloudflared"
+            cp "$RUNNER_TEMP/cloudflared" "$TOOLS/cloudflared"
+          fi
           touch "$RUNNER_TEMP/cloudflared.ready"
-          npm install --prefix "$RUNNER_TEMP/serve-sim" serve-sim@0.1.47
+          if [ -x "$TOOLS/serve-sim/node_modules/.bin/serve-sim" ]; then
+            rm -rf "$RUNNER_TEMP/serve-sim"
+            cp -R "$TOOLS/serve-sim" "$RUNNER_TEMP/serve-sim"
+          else
+            npm install --prefix "$RUNNER_TEMP/serve-sim" serve-sim@0.1.47
+            rm -rf "$TOOLS/serve-sim"
+            cp -R "$RUNNER_TEMP/serve-sim" "$TOOLS/serve-sim"
+          fi
           touch "$RUNNER_TEMP/serve-sim.ready"
           if [ "$VIBE_MODE" = "dev-client" ]; then
             exit 0
@@ -162,18 +209,17 @@ jobs:
         id: sim
         run: |
           set -euo pipefail
-          DEVICE='${{ inputs.device }}'
-          [ -n "$DEVICE" ] || DEVICE="iPhone 17 Pro"
-          UDID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/' || true)
-          if [ -z "$UDID" ]; then
-            echo "::warning::$DEVICE is not on this image; using the newest iPhone"
-            UDID=$(xcrun simctl list devices available | grep -E '^\s+iPhone' | tail -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          for _ in $(seq 1 240); do
+            [ -f "$RUNNER_TEMP/sim.ready" ] && break
+            sleep 1
+          done
+          if [ ! -f "$RUNNER_TEMP/sim.ready" ]; then
+            echo "Simulator boot failed" >&2
+            cat "$RUNNER_TEMP/boot-sim.log" >&2 || true
+            exit 1
           fi
-          [ -n "$UDID" ] || { echo "No iOS simulator available"; exit 1; }
-          xcrun simctl boot "$UDID" || true
-          xcrun simctl bootstatus "$UDID" -b
+          UDID=$(cat "$RUNNER_TEMP/udid")
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json" || true
           echo "VIBE_DEVICES_JSON=$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/devices.json","utf8")); const names=[]; for (const rt of Object.values(j.devices||{})) for (const d of rt) if (d.isAvailable) names.push(d.name); process.stdout.write(JSON.stringify(names.slice(0,40)))')" >> "$GITHUB_ENV" || true
 
       - name: Start serve-sim
@@ -361,6 +407,14 @@ jobs:
           node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
             --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "agent-ready"
 
+      - name: Save stream tools
+        if: steps.tools.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.vibe-native/ios-tools
+          key: vibe-ios-tools-serve-sim-0.1.47
+
       - name: Hold the stream open
         env:
           AGENT_ENABLED: ${{ inputs.agent_device }}
@@ -418,19 +472,6 @@ jobs:
       VIBE_RUNNER_VERSION: "0.1.0"
       ANDROID_API: "35"
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        if: inputs.mode == 'dev-client'
-        with:
-          node-version: 22
-
-      - uses: actions/setup-java@v4
-        if: inputs.mode == 'dev-client'
-        with:
-          distribution: temurin
-          java-version: 17
-
       - name: Enable KVM
         run: |
           set -euo pipefail
@@ -438,20 +479,6 @@ jobs:
           sudo udevadm control --reload-rules || true
           sudo udevadm trigger --name-match=kvm || true
           if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; else echo "::warning::/dev/kvm is missing; the emulator will be slow or fail"; fi
-
-      - name: Mask session secrets
-        run: |
-          set -euo pipefail
-          echo "::add-mask::$VIBE_SESSION_KEYS"
-          node <<'NODE'
-          const book = JSON.parse(process.env.VIBE_SESSION_KEYS || "{}");
-          const entry = book[process.env.SESSION];
-          if (!entry?.token) { console.error("VIBE_SESSION_KEYS has no token for this session"); process.exit(1); }
-          const fs = require("fs");
-          fs.writeFileSync(process.env.RUNNER_TEMP + "/vibe-session.env", `GATE_TOKEN=${entry.token}\nDEV_URL=${entry.devUrl || ""}\n`);
-          NODE
-          echo "::add-mask::$(grep '^GATE_TOKEN=' "$RUNNER_TEMP/vibe-session.env" | cut -d= -f2-)"
-          echo "::add-mask::$(grep '^DEV_URL=' "$RUNNER_TEMP/vibe-session.env" | cut -d= -f2-)"
 
       - name: Install Android SDK
         run: |
@@ -471,6 +498,79 @@ jobs:
           echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "$SDK/platform-tools" >> "$GITHUB_PATH"
           echo "$SDK/emulator" >> "$GITHUB_PATH"
+
+      - name: Fetch emulator tools before checkout
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/fetch-android-tools.sh" <<'EOF'
+          set -euo pipefail
+          if [ ! -f "$RUNNER_TEMP/ffmpeg.ready" ]; then
+            if ! command -v ffmpeg >/dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y ffmpeg
+            fi
+            touch "$RUNNER_TEMP/ffmpeg.ready"
+          fi
+          if [ ! -f "$RUNNER_TEMP/cloudflared.ready" ]; then
+            curl -fsSL --retry 5 -o "$RUNNER_TEMP/cloudflared" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x "$RUNNER_TEMP/cloudflared"
+            touch "$RUNNER_TEMP/cloudflared.ready"
+          fi
+          EOF
+          nohup bash "$RUNNER_TEMP/fetch-android-tools.sh" > "$RUNNER_TEMP/fetch-android-tools.log" 2>&1 &
+
+      - name: Restore emulator snapshot
+        id: avd
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API }}/google_apis/x86_64
+            /usr/local/lib/android/sdk/emulator
+            ~/.android/avd
+          key: vibe-avd-api${{ env.ANDROID_API }}-google-x64-v1
+
+      - name: Start the cached emulator before checkout
+        run: |
+          set -euo pipefail
+          if [ ! -d "$HOME/.android/avd/vibe.avd/snapshots/vibe-ready" ]; then
+            echo "No snapshot yet; the boot step will cold-boot after checkout"
+            exit 0
+          fi
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          ACCEL=off
+          [ -w /dev/kvm ] && ACCEL=on
+          nohup emulator -avd vibe -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-metrics \
+            -camera-back none -camera-front none -accel "$ACCEL" -no-snapshot-save -snapshot vibe-ready \
+            > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          touch "$RUNNER_TEMP/emulator.early"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        if: inputs.mode == 'dev-client'
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        if: inputs.mode == 'dev-client'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Mask session secrets
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$VIBE_SESSION_KEYS"
+          node <<'NODE'
+          const book = JSON.parse(process.env.VIBE_SESSION_KEYS || "{}");
+          const entry = book[process.env.SESSION];
+          if (!entry?.token) { console.error("VIBE_SESSION_KEYS has no token for this session"); process.exit(1); }
+          const fs = require("fs");
+          fs.writeFileSync(process.env.RUNNER_TEMP + "/vibe-session.env", `GATE_TOKEN=${entry.token}\nDEV_URL=${entry.devUrl || ""}\n`);
+          NODE
+          echo "::add-mask::$(grep '^GATE_TOKEN=' "$RUNNER_TEMP/vibe-session.env" | cut -d= -f2-)"
+          echo "::add-mask::$(grep '^DEV_URL=' "$RUNNER_TEMP/vibe-session.env" | cut -d= -f2-)"
 
       - name: Install JS dependencies
         if: inputs.mode == 'dev-client'
@@ -516,42 +616,21 @@ jobs:
           key: vibe-gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: vibe-gradle-${{ runner.os }}-
 
-      - name: Fetch Expo Go tools during emulator boot
+      - name: Download Expo Go
+        if: inputs.mode != 'dev-client'
         env:
-          VIBE_MODE: ${{ inputs.mode }}
           VIBE_PROJECT_DIR: ${{ inputs.project_dir }}
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/fetch-android-tools.sh" <<'EOF'
+          cat > "$RUNNER_TEMP/fetch-expogo.sh" <<'EOF'
           set -euo pipefail
-          if ! command -v ffmpeg >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y ffmpeg
-          fi
-          touch "$RUNNER_TEMP/ffmpeg.ready"
-          curl -fsSL --retry 5 -o "$RUNNER_TEMP/cloudflared" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x "$RUNNER_TEMP/cloudflared"
-          touch "$RUNNER_TEMP/cloudflared.ready"
-          if [ "$VIBE_MODE" = "dev-client" ]; then
-            exit 0
-          fi
           cd "$GITHUB_WORKSPACE/$VIBE_PROJECT_DIR"
           curl -fsSL --retry 5 -o "$RUNNER_TEMP/versions.json" https://exp.host/--/api/v2/versions
           URL=$(node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync("package.json","utf8")); const major=(String((pkg.dependencies||{}).expo||"54").match(/\d+/)||["54"])[0]; const all=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/versions.json","utf8")); const keys=Object.keys(all.sdkVersions||{}).filter((k)=>k.startsWith(major+".")).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})); const entry=all.sdkVersions[keys.at(-1)]; if(!entry||!entry.androidClientUrl){console.error("no Expo Go apk for SDK "+major); process.exit(1);} process.stdout.write(entry.androidClientUrl);')
           curl -fsSL --retry 5 -o "$RUNNER_TEMP/expogo.apk" "$URL"
           touch "$RUNNER_TEMP/expogo.ready"
           EOF
-          nohup bash "$RUNNER_TEMP/fetch-android-tools.sh" > "$RUNNER_TEMP/fetch-android-tools.log" 2>&1 &
-
-      - name: Restore emulator snapshot
-        id: avd
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API }}/google_apis/x86_64
-            /usr/local/lib/android/sdk/emulator
-            ~/.android/avd
-          key: vibe-avd-api${{ env.ANDROID_API }}-google-x64-v1
+          nohup bash "$RUNNER_TEMP/fetch-expogo.sh" > "$RUNNER_TEMP/fetch-expogo.log" 2>&1 &
 
       - name: Boot emulator
         id: boot
@@ -619,7 +698,15 @@ jobs:
             sleep 2
           }
           booted=false
-          if [ -d "$ANDROID_AVD_HOME/vibe.avd/snapshots/vibe-ready" ]; then
+          if [ -f "$RUNNER_TEMP/emulator.early" ]; then
+            echo "Waiting for the emulator that started before checkout"
+            if wait_boot 60; then
+              booted=true
+            else
+              echo "Early snapshot boot did not finish; cold boot"
+              stop_emulator
+            fi
+          elif [ -d "$ANDROID_AVD_HOME/vibe.avd/snapshots/vibe-ready" ]; then
             echo "Booting the cached emulator snapshot"
             nohup emulator -avd vibe "${OPTS[@]}" -no-snapshot-save -snapshot vibe-ready > "$RUNNER_TEMP/emulator.log" 2>&1 &
             if wait_boot 45; then
@@ -696,7 +783,7 @@ jobs:
             [ -f "$RUNNER_TEMP/expogo.apk" ] && [ -f "$RUNNER_TEMP/expogo.ready" ] && break
             sleep 1
           done
-          [ -f "$RUNNER_TEMP/expogo.apk" ] || { echo "Expo Go download failed" >&2; cat "$RUNNER_TEMP/fetch-android-tools.log" >&2 || true; exit 1; }
+          [ -f "$RUNNER_TEMP/expogo.apk" ] || { echo "Expo Go download failed" >&2; cat "$RUNNER_TEMP/fetch-expogo.log" >&2 || true; exit 1; }
           adb install -r "$RUNNER_TEMP/expogo.apk"
           [ -n "$DEV_URL" ] || { echo "DEV_URL missing from the session secret"; exit 1; }
           adb shell am start -a android.intent.action.VIEW -d "$DEV_URL"
