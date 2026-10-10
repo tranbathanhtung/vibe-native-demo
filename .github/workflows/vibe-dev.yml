@@ -1,0 +1,602 @@
+# vibe-native-template-version: 2
+# Boots a simulator or emulator and streams it until the hold loop ends.
+# Default mode is Expo Go: no native compile, JavaScript comes from the local
+# Metro tunnel. Pass mode=dev-client only when the app has custom native code.
+# The tunnel URL is a commit status so the CLI can read it while the job is
+# still running. The gate token lives in VIBE_SESSION_KEYS, never in a workflow input.
+name: vibe-dev
+run-name: vibe-dev ${{ inputs.session }} · ${{ inputs.platform }} · ${{ inputs.minutes }}m
+
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        description: Session id
+        required: true
+      platform:
+        description: ios or android
+        required: true
+      device:
+        description: Device name from the vibe-native catalog
+        default: ""
+      minutes:
+        description: How long to hold the stream open
+        default: "45"
+      agent_device:
+        description: Expose an agent-device proxy on the tunnel
+        default: "false"
+      agent_device_version:
+        description: agent-device version pinned to the local CLI
+        default: "0.20.1"
+      project_dir:
+        description: App directory relative to the repository root
+        default: "."
+      mode:
+        description: go skips the native compile. dev-client builds a Debug app.
+        default: "go"
+      runner:
+        description: Override runner label
+        default: ""
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: vibe-dev-${{ inputs.session }}-${{ inputs.platform }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    if: inputs.platform == 'ios'
+    runs-on: ${{ inputs.runner != '' && inputs.runner || 'macos-26' }}
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VIBE_SESSION_KEYS: ${{ secrets.VIBE_SESSION_KEYS }}
+      STATUS_CONTEXT: vibe-native/${{ inputs.session }}/ios
+      SESSION: ${{ inputs.session }}
+      GATE_PORT: "3199"
+      PREVIEW_PORT: "3200"
+      AGENT_PORT: "4310"
+      VIBE_RUNNER_VERSION: "0.1.0"
+      BUILD_CONFIGURATION: Debug
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Mask session secrets
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$VIBE_SESSION_KEYS"
+          node <<'NODE'
+          const book = JSON.parse(process.env.VIBE_SESSION_KEYS || "{}");
+          const entry = book[process.env.SESSION];
+          if (!entry?.token) {
+            console.error("VIBE_SESSION_KEYS has no token for this session");
+            process.exit(1);
+          }
+          const fs = require("fs");
+          fs.writeFileSync(process.env.RUNNER_TEMP + "/vibe-session.env", `GATE_TOKEN=${entry.token}\nDEV_URL=${entry.devUrl || ""}\n`);
+          NODE
+          echo "::add-mask::$(grep '^GATE_TOKEN=' "$RUNNER_TEMP/vibe-session.env" | cut -d= -f2-)"
+          echo "::add-mask::$(grep '^DEV_URL=' "$RUNNER_TEMP/vibe-session.env" | cut -d= -f2-)"
+
+      - name: Install JS dependencies
+        if: inputs.mode == 'dev-client'
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            curl -fsSL https://bun.sh/install | bash
+            echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.bun/bin:$PATH"
+            bun install --frozen-lockfile
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --immutable || yarn install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Fingerprint native build inputs
+        if: inputs.mode == 'dev-client'
+        id: fp
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          HASH=$(npx --yes @expo/fingerprint fingerprint:generate --platform ios \
+            | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).hash)')
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached dev client
+        if: inputs.mode == 'dev-client'
+        id: appcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ inputs.project_dir }}/build/vibe-app
+          key: vibe-app-${{ runner.os }}-expo-${{ inputs.project_dir }}-Debug-${{ steps.fp.outputs.hash }}
+
+      - name: Boot simulator
+        id: sim
+        run: |
+          set -euo pipefail
+          DEVICE='${{ inputs.device }}'
+          [ -n "$DEVICE" ] || DEVICE="iPhone 17 Pro"
+          UDID=$(xcrun simctl list devices available | grep -F "$DEVICE (" | head -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/' || true)
+          if [ -z "$UDID" ]; then
+            echo "::warning::$DEVICE is not on this image; using the newest iPhone"
+            UDID=$(xcrun simctl list devices available | grep -E '^\s+iPhone' | tail -1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')
+          fi
+          [ -n "$UDID" ] || { echo "No iOS simulator available"; exit 1; }
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json" || true
+          echo "VIBE_DEVICES_JSON=$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/devices.json","utf8")); const names=[]; for (const rt of Object.values(j.devices||{})) for (const d of rt) if (d.isAvailable) names.push(d.name); process.stdout.write(JSON.stringify(names.slice(0,40)))')" >> "$GITHUB_ENV" || true
+
+      - name: Start serve-sim
+        run: |
+          set -euo pipefail
+          # MJPEG only. /stream.avcc emits zero bytes on GitHub macOS runners.
+          # Do not pass --detach: the detached child drops --allow-any-host-when-insecure.
+          nohup npx --yes serve-sim --quiet --allow-any-host-when-insecure \
+            --port "$PREVIEW_PORT" --codec mjpeg --mjpeg-fps 30 --mjpeg-quality 0.7 --max-dimension 900 \
+            > "$RUNNER_TEMP/serve-sim.json" 2> "$RUNNER_TEMP/serve-sim.log" &
+          for _ in $(seq 1 90); do
+            curl -fsS "http://127.0.0.1:$PREVIEW_PORT/readyz" >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          echo "serve-sim never became ready" >&2
+          cat "$RUNNER_TEMP/serve-sim.log" >&2 || true
+          exit 1
+
+      - name: Start auth gate
+        env:
+          NATIVE_AGENT: ${{ inputs.agent_device == 'true' && '4310' || '' }}
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          ARGS=(gate --session "$SESSION" --target "$PREVIEW_PORT" --listen "$GATE_PORT")
+          if [ -n "$NATIVE_AGENT" ]; then ARGS+=(--agent "$NATIVE_AGENT"); fi
+          nohup node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" "${ARGS[@]}" > "$RUNNER_TEMP/gate.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:$GATE_PORT/__vibe/healthz" >/dev/null && exit 0
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/gate.log" >&2
+          exit 1
+
+      - name: Open tunnel and publish URL
+        id: tunnel
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-all-errors -o cloudflared.tgz \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+          tar -xzf cloudflared.tgz
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$GATE_PORT" --logfile "$RUNNER_TEMP/cloudflared.log" >/dev/null 2>&1 &
+          TUNNEL=""
+          for _ in $(seq 1 60); do
+            TUNNEL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$RUNNER_TEMP/cloudflared.log" | head -1 || true)
+            [ -n "$TUNNEL" ] && break
+            sleep 2
+          done
+          [ -n "$TUNNEL" ] || { echo "cloudflared never reported a URL"; exit 1; }
+          echo "url=$TUNNEL" >> "$GITHUB_OUTPUT"
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state success --url "$TUNNEL" --description "stream-live"
+          {
+            echo "## vibe-native"
+            echo
+            echo "Simulator stream is up. The access key stays in the CLI."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open in Expo Go
+        if: inputs.mode != 'dev-client'
+        working-directory: ${{ inputs.project_dir }}
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/versions.json" https://exp.host/--/api/v2/versions
+          URL=$(node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync("package.json","utf8")); const major=(String((pkg.dependencies||{}).expo||"54").match(/\d+/)||["54"])[0]; const all=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/versions.json","utf8")); const keys=Object.keys(all.sdkVersions||{}).filter((k)=>k.startsWith(major+".")).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})); const entry=all.sdkVersions[keys.at(-1)]; if(!entry||!entry.iosClientUrl){console.error("no Expo Go build for SDK "+major); process.exit(1);} process.stdout.write(entry.iosClientUrl);')
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/expogo.tar.gz" "$URL"
+          rm -rf "$RUNNER_TEMP/expogo" && mkdir -p "$RUNNER_TEMP/expogo"
+          tar -xzf "$RUNNER_TEMP/expogo.tar.gz" -C "$RUNNER_TEMP/expogo"
+          APP=$(find "$RUNNER_TEMP/expogo" -name '*.app' | head -1)
+          [ -n "$APP" ] || { echo "Expo Go archive had no .app"; exit 1; }
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" host.exp.Exponent || true
+          [ -n "$DEV_URL" ] || { echo "DEV_URL missing from the session secret"; exit 1; }
+          xcrun simctl openurl "$UDID" "$DEV_URL"
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "app-installed"
+
+      - name: Build dev client
+        if: inputs.mode == 'dev-client' && steps.appcache.outputs.cache-hit != 'true'
+        timeout-minutes: 60
+        working-directory: ${{ inputs.project_dir }}
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform ios --no-install
+          npx pod-install ios
+          WORKSPACE=$(find ios -maxdepth 1 -name '*.xcworkspace' | head -1)
+          [ -n "$WORKSPACE" ] || { echo "No .xcworkspace after pod install"; exit 1; }
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Debug -sdk iphonesimulator \
+            -destination "id=$UDID" -derivedDataPath build/ios CODE_SIGNING_ALLOWED=NO -quiet build
+          APP=$(find build/ios/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' | head -1)
+          [ -n "$APP" ] || { echo "No .app produced"; exit 1; }
+          rm -rf build/vibe-app && mkdir -p build/vibe-app && cp -R "$APP" build/vibe-app/
+
+      - name: Save dev client cache
+        if: inputs.mode == 'dev-client' && steps.appcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ inputs.project_dir }}/build/vibe-app
+          key: vibe-app-${{ runner.os }}-expo-${{ inputs.project_dir }}-Debug-${{ steps.fp.outputs.hash }}
+
+      - name: Install and open dev client
+        if: inputs.mode == 'dev-client'
+        working-directory: ${{ inputs.project_dir }}
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          APP=$(find build/vibe-app -maxdepth 1 -name '*.app' | head -1)
+          [ -n "$APP" ] || { echo "No .app to install"; exit 1; }
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" "$BUNDLE_ID"
+          if [ -n "$DEV_URL" ]; then
+            xcrun simctl openurl "$UDID" "$DEV_URL"
+          fi
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "app-installed"
+
+      - name: Install agent-device
+        if: inputs.agent_device == 'true'
+        id: ad
+        run: |
+          set -euo pipefail
+          npm install -g "agent-device@${{ inputs.agent_device_version }}"
+          echo "xcode=$(xcodebuild -version | head -1 | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache agent-device XCTest runner
+        if: inputs.agent_device == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.agent-device/apple-runner/derived
+          key: vibe-agent-device-${{ runner.os }}-${{ inputs.agent_device_version }}-${{ steps.ad.outputs.xcode }}
+
+      - name: Start agent-device proxy
+        if: inputs.agent_device == 'true'
+        env:
+          AGENT_DEVICE_DAEMON_IDLE_TIMEOUT_MS: "0"
+          AGENT_DEVICE_IOS_RUNNER_IDLE_STOP_MS: "0"
+          AGENT_DEVICE_LEASE_TTL_MS: "21600000"
+          AGENT_DEVICE_LEASE_MAX_TTL_MS: "21600000"
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          nohup agent-device proxy --host 127.0.0.1 --port "$AGENT_PORT" --daemon-auth-token "$GATE_TOKEN" \
+            > "$RUNNER_TEMP/agent-device.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:$AGENT_PORT/health" >/dev/null && break
+            sleep 1
+          done
+          agent-device prepare ios-runner --platform ios --timeout 900000 || echo "::warning::prepare ios-runner failed; the hold loop will restart the daemon"
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "agent-ready"
+
+      - name: Hold the stream open
+        env:
+          AGENT_ENABLED: ${{ inputs.agent_device }}
+          AGENT_DEVICE_DAEMON_IDLE_TIMEOUT_MS: "0"
+          AGENT_DEVICE_IOS_RUNNER_IDLE_STOP_MS: "0"
+          AGENT_DEVICE_LEASE_TTL_MS: "21600000"
+          AGENT_DEVICE_LEASE_MAX_TTL_MS: "21600000"
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          restart() {
+            pkill -f 'agent-device proxy' 2>/dev/null || true
+            agent-device daemon stop --clean >/dev/null 2>&1 || true
+            nohup agent-device proxy --host 127.0.0.1 --port "$AGENT_PORT" --daemon-auth-token "$GATE_TOKEN" >> "$RUNNER_TEMP/agent-device.log" 2>&1 &
+          }
+          export -f restart || true
+          # The shell hold loop inspects {"ok":true}. curl -f treats {"ok":false} as success.
+          MINUTES=${{ inputs.minutes }}
+          [ "$MINUTES" -le 350 ] || MINUTES=350
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          LAST=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            curl -fsS -o /dev/null "http://127.0.0.1:$PREVIEW_PORT/healthz" || { echo "::error::serve-sim stopped"; exit 1; }
+            if [ "$AGENT_ENABLED" = "true" ] && ! curl -fsS -m 10 "http://127.0.0.1:$AGENT_PORT/health" | grep -q '"ok":true'; then
+              NOW=$(date +%s)
+              if [ $(( NOW - LAST )) -ge 60 ]; then
+                LAST=$NOW
+                echo "::warning::agent-device daemon unhealthy; restarting"
+                pkill -f 'agent-device proxy' 2>/dev/null || true
+                agent-device daemon stop --clean >/dev/null 2>&1 || true
+                nohup agent-device proxy --host 127.0.0.1 --port "$AGENT_PORT" --daemon-auth-token "$GATE_TOKEN" >> "$RUNNER_TEMP/agent-device.log" 2>&1 &
+              fi
+            fi
+            sleep 15
+          done
+
+      - name: Mark session ended
+        if: always()
+        run: |
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state failure --description "ended" || true
+
+  android:
+    if: inputs.platform == 'android'
+    runs-on: ${{ inputs.runner != '' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VIBE_SESSION_KEYS: ${{ secrets.VIBE_SESSION_KEYS }}
+      STATUS_CONTEXT: vibe-native/${{ inputs.session }}/android
+      SESSION: ${{ inputs.session }}
+      GATE_PORT: "3199"
+      PREVIEW_PORT: "3300"
+      AGENT_PORT: "4310"
+      VIBE_RUNNER_VERSION: "0.1.0"
+      ANDROID_API: "35"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Enable KVM
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules || true
+          sudo udevadm trigger --name-match=kvm || true
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; else echo "::warning::/dev/kvm is missing; the emulator will be slow or fail"; fi
+
+      - name: Mask session secrets
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$VIBE_SESSION_KEYS"
+          node <<'NODE'
+          const book = JSON.parse(process.env.VIBE_SESSION_KEYS || "{}");
+          const entry = book[process.env.SESSION];
+          if (!entry?.token) { console.error("VIBE_SESSION_KEYS has no token for this session"); process.exit(1); }
+          const fs = require("fs");
+          fs.writeFileSync(process.env.RUNNER_TEMP + "/vibe-session.env", `GATE_TOKEN=${entry.token}\nDEV_URL=${entry.devUrl || ""}\n`);
+          NODE
+          echo "::add-mask::$(grep '^GATE_TOKEN=' "$RUNNER_TEMP/vibe-session.env" | cut -d= -f2-)"
+          echo "::add-mask::$(grep '^DEV_URL=' "$RUNNER_TEMP/vibe-session.env" | cut -d= -f2-)"
+
+      - name: Install Android SDK
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y sdkmanager || true
+          if ! command -v sdkmanager >/dev/null; then
+            curl -fsSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            rm -rf "$HOME/android-sdk"
+            mkdir -p "$HOME/android-sdk/cmdline-tools"
+            unzip -q cmdtools.zip -d "$HOME/android-sdk/cmdline-tools"
+            mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+          fi
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$HOME/android-sdk/platform-tools" >> "$GITHUB_PATH"
+          echo "$HOME/android-sdk/emulator" >> "$GITHUB_PATH"
+
+      - name: Install JS dependencies
+        if: inputs.mode == 'dev-client'
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            curl -fsSL https://bun.sh/install | bash
+            echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.bun/bin:$PATH"
+            bun install --frozen-lockfile
+          elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && (yarn install --immutable || yarn install --frozen-lockfile)
+          elif [ -f package-lock.json ]; then npm ci
+          else npm install
+          fi
+
+      - name: Fingerprint native build inputs
+        if: inputs.mode == 'dev-client'
+        id: fp
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          HASH=$(npx --yes @expo/fingerprint fingerprint:generate --platform android \
+            | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).hash)')
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached APK
+        if: inputs.mode == 'dev-client'
+        id: apkcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ inputs.project_dir }}/build/vibe-apk
+          key: vibe-apk-${{ runner.os }}-expo-${{ inputs.project_dir }}-Debug-${{ steps.fp.outputs.hash }}
+
+      - name: Cache Gradle
+        if: inputs.mode == 'dev-client'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: vibe-gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: vibe-gradle-${{ runner.os }}-
+
+      - name: Boot emulator
+        run: |
+          set -euo pipefail
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-${ANDROID_API}" "emulator" "system-images;android-${ANDROID_API};google_apis;x86_64"
+          echo no | avdmanager create avd -n vibe -k "system-images;android-${ANDROID_API};google_apis;x86_64" -d pixel_7 --force
+          nohup emulator -avd vibe -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          adb wait-for-device
+          for _ in $(seq 1 90); do
+            BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            [ "$BOOT" = "1" ] && break
+            sleep 2
+          done
+          adb shell getprop sys.boot_completed | grep -q 1
+
+      - name: Start Android stream
+        run: |
+          set -euo pipefail
+          nohup node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" android-serve --port "$PREVIEW_PORT" > "$RUNNER_TEMP/android.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:$PREVIEW_PORT/health" >/dev/null && exit 0
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/android.log" >&2
+          exit 1
+
+      - name: Start auth gate and tunnel
+        id: tunnel
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          AGENT_ARG=()
+          if [ '${{ inputs.agent_device }}' = 'true' ]; then AGENT_ARG=(--agent "$AGENT_PORT"); fi
+          nohup node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" gate --session "$SESSION" --target "$PREVIEW_PORT" --listen "$GATE_PORT" "${AGENT_ARG[@]}" > "$RUNNER_TEMP/gate.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:$GATE_PORT/__vibe/healthz" >/dev/null && break
+            sleep 1
+          done
+          curl -fsSL --retry 5 -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$GATE_PORT" --logfile "$RUNNER_TEMP/cloudflared.log" >/dev/null 2>&1 &
+          TUNNEL=""
+          for _ in $(seq 1 60); do
+            TUNNEL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$RUNNER_TEMP/cloudflared.log" | head -1 || true)
+            [ -n "$TUNNEL" ] && break
+            sleep 2
+          done
+          [ -n "$TUNNEL" ] || exit 1
+          echo "url=$TUNNEL" >> "$GITHUB_OUTPUT"
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state success --url "$TUNNEL" --description "stream-live"
+
+      - name: Open in Expo Go
+        if: inputs.mode != 'dev-client'
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/versions.json" https://exp.host/--/api/v2/versions
+          URL=$(node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync("package.json","utf8")); const major=(String((pkg.dependencies||{}).expo||"54").match(/\d+/)||["54"])[0]; const all=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/versions.json","utf8")); const keys=Object.keys(all.sdkVersions||{}).filter((k)=>k.startsWith(major+".")).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})); const entry=all.sdkVersions[keys.at(-1)]; if(!entry||!entry.androidClientUrl){console.error("no Expo Go apk for SDK "+major); process.exit(1);} process.stdout.write(entry.androidClientUrl);')
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/expogo.apk" "$URL"
+          adb install -r "$RUNNER_TEMP/expogo.apk"
+          [ -n "$DEV_URL" ] || { echo "DEV_URL missing from the session secret"; exit 1; }
+          adb shell am start -a android.intent.action.VIEW -d "$DEV_URL"
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "app-installed"
+
+      - name: Build debug APK
+        if: inputs.mode == 'dev-client' && steps.apkcache.outputs.cache-hit != 'true'
+        timeout-minutes: 45
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform android --no-install
+          cd android && ./gradlew assembleDebug --no-daemon
+          mkdir -p ../build/vibe-apk
+          find . -path '*outputs/apk/debug/*.apk' -exec cp {} ../build/vibe-apk/app-debug.apk \;
+
+      - name: Save APK cache
+        if: inputs.mode == 'dev-client' && steps.apkcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ inputs.project_dir }}/build/vibe-apk
+          key: vibe-apk-${{ runner.os }}-expo-${{ inputs.project_dir }}-Debug-${{ steps.fp.outputs.hash }}
+
+      - name: Install and open dev client
+        if: inputs.mode == 'dev-client'
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          adb install -r build/vibe-apk/app-debug.apk
+          if [ -n "$DEV_URL" ]; then
+            adb shell am start -a android.intent.action.VIEW -d "$DEV_URL"
+          fi
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "app-installed"
+
+      - name: Start agent-device proxy
+        if: inputs.agent_device == 'true'
+        env:
+          AGENT_DEVICE_DAEMON_IDLE_TIMEOUT_MS: "0"
+          AGENT_DEVICE_LEASE_TTL_MS: "21600000"
+          AGENT_DEVICE_LEASE_MAX_TTL_MS: "21600000"
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          npm install -g "agent-device@${{ inputs.agent_device_version }}"
+          nohup agent-device proxy --host 127.0.0.1 --port "$AGENT_PORT" --daemon-auth-token "$GATE_TOKEN" > "$RUNNER_TEMP/agent-device.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:$AGENT_PORT/health" >/dev/null && break
+            sleep 1
+          done
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "agent-ready"
+
+      - name: Hold the stream open
+        env:
+          AGENT_ENABLED: ${{ inputs.agent_device }}
+          AGENT_DEVICE_DAEMON_IDLE_TIMEOUT_MS: "0"
+          AGENT_DEVICE_LEASE_TTL_MS: "21600000"
+          AGENT_DEVICE_LEASE_MAX_TTL_MS: "21600000"
+        run: |
+          set -euo pipefail
+          set -a; source "$RUNNER_TEMP/vibe-session.env"; set +a
+          MINUTES=${{ inputs.minutes }}
+          [ "$MINUTES" -le 350 ] || MINUTES=350
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          LAST=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            curl -fsS -o /dev/null "http://127.0.0.1:$PREVIEW_PORT/health" || { echo "::error::android stream stopped"; exit 1; }
+            if [ "$AGENT_ENABLED" = "true" ] && ! curl -fsS -m 10 "http://127.0.0.1:$AGENT_PORT/health" | grep -q '"ok":true'; then
+              NOW=$(date +%s)
+              if [ $(( NOW - LAST )) -ge 60 ]; then
+                LAST=$NOW
+                pkill -f 'agent-device proxy' 2>/dev/null || true
+                nohup agent-device proxy --host 127.0.0.1 --port "$AGENT_PORT" --daemon-auth-token "$GATE_TOKEN" >> "$RUNNER_TEMP/agent-device.log" 2>&1 &
+              fi
+            fi
+            sleep 15
+          done
+
+      - name: Mark session ended
+        if: always()
+        run: |
+          node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
+            --context "$STATUS_CONTEXT" --state failure --description "ended" || true

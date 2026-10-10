@@ -1,0 +1,141 @@
+# vibe-native-template-version: 1
+name: vibe-release
+run-name: vibe-release ${{ inputs.session }} · ${{ inputs.platform }} · ${{ inputs.destination }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        required: true
+      platform:
+        required: true
+      destination:
+        description: testflight, app-store, or play
+        default: testflight
+      track:
+        description: Play track
+        default: internal
+      notes:
+        default: "vibe-native release"
+      project_dir:
+        default: "."
+      package_name:
+        description: Android application id
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    if: inputs.platform == 'ios'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+      IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install JS dependencies
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          else npm install
+          fi
+      - name: Sign and archive
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$IOS_CERTIFICATE_PASSWORD"
+          echo "::add-mask::$ASC_PRIVATE_KEY"
+          npx expo prebuild --platform ios --no-install
+          npx pod-install ios
+          echo "$IOS_CERTIFICATE" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          echo "$IOS_PROVISIONING_PROFILE" | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
+          printf '%s' "$ASC_PRIVATE_KEY" > "$RUNNER_TEMP/AuthKey.p8"
+          KEYCHAIN="$RUNNER_TEMP/vibe.keychain"
+          security create-keychain -p "$IOS_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$IOS_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$IOS_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$(security cms -D -i "$RUNNER_TEMP/profile.mobileprovision")")
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          WORKSPACE=$(find ios -maxdepth 1 -name '*.xcworkspace' | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            DEVELOPMENT_TEAM="$IOS_TEAM_ID" CODE_SIGN_STYLE=Manual archive
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>$IOS_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>uploadSymbols</key><true/>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/app.xcarchive" -exportPath "$RUNNER_TEMP/export" -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+          IPA=$(find "$RUNNER_TEMP/export" -name '*.ipa' | head -1)
+          [ -n "$IPA" ] || { echo "No IPA exported"; exit 1; }
+          xcrun altool --upload-app --type ios --file "$IPA" --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --p8-file-path "$RUNNER_TEMP/AuthKey.p8"
+          echo "Uploaded $IPA to App Store Connect (${{ inputs.destination }})."
+
+  android:
+    if: inputs.platform == 'android'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+      ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Install vibe-runner
+        run: |
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/vibe-runner" \
+            "https://github.com/vibe-native/vibe-native/releases/download/v0.1.0/vibe-runner-linux-x64"
+          chmod +x "$RUNNER_TEMP/vibe-runner"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Build signed AAB
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$ANDROID_KEYSTORE_PASSWORD"
+          echo "::add-mask::$ANDROID_KEY_PASSWORD"
+          npx expo prebuild --platform android --no-install
+          echo "$ANDROID_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.p12"
+          cd android
+          ./gradlew bundleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.p12" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="${ANDROID_KEY_ALIAS:-vibe-native}" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
+          find . -name '*.aab' -exec cp {} "$RUNNER_TEMP/app.aab" \;
+      - name: Upload to Play
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/play.json"
+          echo "::add-mask::$PLAY_SERVICE_ACCOUNT_JSON"
+          vibe-runner play-upload --json "$RUNNER_TEMP/play.json" --aab "$RUNNER_TEMP/app.aab" \
+            --package '${{ inputs.package_name }}' --track '${{ inputs.track }}' --notes '${{ inputs.notes }}'

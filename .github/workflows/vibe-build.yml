@@ -1,0 +1,150 @@
+# vibe-native-template-version: 1
+name: vibe-build
+run-name: vibe-build ${{ inputs.session }} · ${{ inputs.platform }} · ${{ inputs.profile }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        required: true
+      platform:
+        description: ios or android
+        required: true
+      profile:
+        default: release-simulator
+      project_dir:
+        default: "."
+      configuration:
+        description: Debug or Release
+        default: Release
+      simulator:
+        description: "true for a simulator .app or emulator APK"
+        default: "true"
+      android_task:
+        description: assembleDebug, assembleRelease, or bundleRelease
+        default: assembleRelease
+      runner:
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ios:
+    if: inputs.platform == 'ios'
+    runs-on: ${{ inputs.runner != '' && inputs.runner || 'macos-26' }}
+    timeout-minutes: 120
+    env:
+      VIBE_SESSION_KEYS: ${{ secrets.VIBE_SESSION_KEYS }}
+      IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install JS dependencies
+        run: |
+          set -euo pipefail
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install --frozen-lockfile
+          elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && (yarn install --immutable || yarn install --frozen-lockfile)
+          elif [ -f package-lock.json ]; then npm ci
+          else npm install
+          fi
+      - name: Build iOS
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform ios --no-install
+          npx pod-install ios
+          WORKSPACE=$(find ios -maxdepth 1 -name '*.xcworkspace' | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          if [ '${{ inputs.simulator }}' = 'true' ]; then
+            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration '${{ inputs.configuration }}' \
+              -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build/ios \
+              CODE_SIGNING_ALLOWED=NO -quiet build
+            APP=$(find "build/ios/Build/Products/${{ inputs.configuration }}-iphonesimulator" -maxdepth 1 -name '*.app' | head -1)
+            mkdir -p build/out
+            tar -C "$(dirname "$APP")" -czf "build/out/$(basename "$APP").tar.gz" "$(basename "$APP")"
+          else
+            echo "::add-mask::$IOS_CERTIFICATE_PASSWORD"
+            echo "$IOS_CERTIFICATE" | base64 -d > "$RUNNER_TEMP/cert.p12"
+            echo "$IOS_PROVISIONING_PROFILE" | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
+            KEYCHAIN="$RUNNER_TEMP/vibe.keychain"
+            security create-keychain -p "$IOS_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+            security default-keychain -s "$KEYCHAIN"
+            security unlock-keychain -p "$IOS_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+            security import "$RUNNER_TEMP/cert.p12" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$IOS_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/"
+            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
+              -sdk iphoneos -destination 'generic/platform=iOS' -archivePath build/app.xcarchive \
+              -allowProvisioningUpdates DEVELOPMENT_TEAM="$IOS_TEAM_ID" archive
+            mkdir -p build/out
+            xcodebuild -exportArchive -archivePath build/app.xcarchive -exportPath build/out \
+              -exportOptionsPlist ios/ExportOptions.plist || find build -name '*.ipa' -exec cp {} build/out/ \;
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vibe-build-${{ inputs.session }}
+          path: ${{ inputs.project_dir }}/build/out/**
+          if-no-files-found: error
+          retention-days: 7
+
+  android:
+    if: inputs.platform == 'android'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Install JS dependencies
+        run: |
+          set -euo pipefail
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          else npm install
+          fi
+      - name: Build Android
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform android --no-install
+          SIGN=()
+          if [ -n "${ANDROID_KEYSTORE:-}" ]; then
+            echo "::add-mask::$ANDROID_KEYSTORE_PASSWORD"
+            echo "::add-mask::$ANDROID_KEY_PASSWORD"
+            echo "$ANDROID_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.p12"
+            SIGN=(
+              -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.p12"
+              -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD"
+              -Pandroid.injected.signing.key.alias="${ANDROID_KEY_ALIAS:-vibe-native}"
+              -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
+            )
+          fi
+          cd android
+          ./gradlew '${{ inputs.android_task }}' --no-daemon "${SIGN[@]}"
+          mkdir -p ../build/out
+          find . -path '*outputs/apk/*/*.apk' -o -path '*outputs/bundle/*/*.aab' | while read -r file; do cp "$file" ../build/out/; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vibe-build-${{ inputs.session }}
+          path: ${{ inputs.project_dir }}/build/out/**
+          if-no-files-found: error
+          retention-days: 7
