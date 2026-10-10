@@ -1,4 +1,4 @@
-# vibe-native-template-version: 2
+# vibe-native-template-version: 3
 # Boots a simulator or emulator and streams it until the hold loop ends.
 # Default mode is Expo Go: no native compile, JavaScript comes from the local
 # Metro tunnel. Pass mode=dev-client only when the app has custom native code.
@@ -527,6 +527,11 @@ jobs:
       - name: Start Android stream
         run: |
           set -euo pipefail
+          # Half-resolution JPEG frames. A full PNG screencap is most of the tap delay.
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
           nohup node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" android-serve --port "$PREVIEW_PORT" > "$RUNNER_TEMP/android.log" 2>&1 &
           for _ in $(seq 1 30); do
             curl -fsS "http://127.0.0.1:$PREVIEW_PORT/health" >/dev/null && exit 0
