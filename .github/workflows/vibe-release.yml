@@ -1,4 +1,4 @@
-# vibe-native-template-version: 1
+# vibe-native-template-version: 4
 name: vibe-release
 run-name: vibe-release ${{ inputs.session }} · ${{ inputs.platform }} · ${{ inputs.destination }}
 
@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   ios:
@@ -41,10 +42,22 @@ jobs:
       IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
+      - name: Restore CocoaPods and JS caches
+        uses: actions/cache@v4
+        id: jscache
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            ~/.cocoapods
+            ${{ inputs.project_dir }}/node_modules
+            ~/.bun/install/cache
+          key: vibe-ios-${{ runner.os }}-${{ hashFiles('bun.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+          restore-keys: vibe-ios-${{ runner.os }}-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Install JS dependencies
+        if: steps.jscache.outputs.cache-hit != 'true'
         run: |
           if [ -f bun.lock ] || [ -f bun.lockb ]; then curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install --frozen-lockfile
           elif [ -f package-lock.json ]; then npm ci
@@ -103,6 +116,17 @@ jobs:
       ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
     steps:
       - uses: actions/checkout@v4
+      - name: Restore Gradle and JS caches
+        uses: actions/cache@v4
+        id: jscache
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ inputs.project_dir }}/node_modules
+            ~/.bun/install/cache
+          key: vibe-android-${{ runner.os }}-${{ hashFiles('bun.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+          restore-keys: vibe-android-${{ runner.os }}-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -125,7 +149,7 @@ jobs:
           npx expo prebuild --platform android --no-install
           echo "$ANDROID_KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.p12"
           cd android
-          ./gradlew bundleRelease --no-daemon \
+          ./gradlew bundleRelease --no-daemon --build-cache \
             -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.p12" \
             -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
             -Pandroid.injected.signing.key.alias="${ANDROID_KEY_ALIAS:-vibe-native}" \
