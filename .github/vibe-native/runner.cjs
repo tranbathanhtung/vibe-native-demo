@@ -5,7 +5,7 @@ const crypto = require("node:crypto");
 const http = require("node:http");
 const https = require("node:https");
 const net = require("node:net");
-const { execFile } = require("node:child_process");
+const { execFile, spawn } = require("node:child_process");
 
 const COOKIE = "vibe_native_k";
 const AGENT_PREFIX = "/agent-device";
@@ -72,16 +72,28 @@ function gateToken() {
 }
 
 function proxyHttp(req, res, port) {
+  const streaming = String(req.url || "").includes("stream.mjpeg");
+  const headers = { ...req.headers, "x-forwarded-proto": "https", "x-forwarded-host": req.headers.host || "" };
+  if (streaming) headers["accept-encoding"] = "identity";
   const upstream = http.request(
     {
       host: "127.0.0.1",
       port,
       method: req.method,
       path: req.url,
-      headers: { ...req.headers, "x-forwarded-proto": "https", "x-forwarded-host": req.headers.host || "" },
+      headers,
     },
     (up) => {
-      res.writeHead(up.statusCode || 502, up.headers);
+      const out = { ...up.headers };
+      if (streaming) {
+        delete out["content-length"];
+        delete out["content-encoding"];
+        out["cache-control"] = "no-cache, no-store, no-transform";
+        out["x-accel-buffering"] = "no";
+      }
+      res.writeHead(up.statusCode || 502, out);
+      res.socket?.setNoDelay(true);
+      up.socket?.setNoDelay(true);
       up.pipe(res);
     },
   );
@@ -200,6 +212,27 @@ function publishStatus(opts) {
   req.end(body);
 }
 
+function motionCommand(message, size) {
+  const x = Math.round(Number(message.x) * size.width);
+  const y = Math.round(Number(message.y) * size.height);
+  const phase = message.type === "begin" ? "DOWN" : message.type === "move" ? "MOVE" : message.type === "end" ? "UP" : null;
+  if (!phase) return null;
+  return ["shell", "input", "motionevent", phase, String(x), String(y)];
+}
+
+/** Android `screencap` without `-p`: 12 or 16 byte header, then tightly packed RGBA. */
+function parseRawScreen(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 16) return null;
+  const width = buffer.readUInt32LE(0);
+  const height = buffer.readUInt32LE(4);
+  const format = buffer.readUInt32LE(8);
+  if (format !== 1 || width < 16 || height < 16 || width > 8192 || height > 8192) return null;
+  const pixels = width * height * 4;
+  const offset = buffer.length === 12 + pixels ? 12 : buffer.length === 16 + pixels ? 16 : 0;
+  if (!offset) return null;
+  return { width, height, pixels: buffer.subarray(offset, offset + pixels) };
+}
+
 function touchCommand(state, message, size) {
   const x = Math.round(Number(message.x) * size.width);
   const y = Math.round(Number(message.y) * size.height);
@@ -246,12 +279,96 @@ function sendWs(socket, payload) {
   socket.write(body);
 }
 
-function acceptWebSocket(req, socket) {
+/** One adb process at a time. Extra finger-moves collapse into the latest point so the queue cannot grow. */
+function createInputPump() {
+  let running = false;
+  const queued = [];
+  function drain() {
+    if (running || queued.length === 0) return;
+    const argv = queued.shift();
+    running = true;
+    execFile("adb", argv, () => {
+      running = false;
+      drain();
+    });
+  }
+  return {
+    run(argv) {
+      if (argv[3] === "MOVE") {
+        const index = queued.findIndex((item) => item[3] === "MOVE");
+        if (index >= 0) queued[index] = argv;
+        else queued.push(argv);
+      } else queued.push(argv);
+      drain();
+    },
+  };
+}
+
+function jpegFromRaw(parsed) {
+  return new Promise((resolve) => {
+    const ff = spawn(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-s",
+        `${parsed.width}x${parsed.height}`,
+        "-i",
+        "pipe:0",
+        "-vf",
+        "scale=720:-2",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "6",
+        "-f",
+        "image2",
+        "-vcodec",
+        "mjpeg",
+        "pipe:1",
+      ],
+      { stdio: ["pipe", "pipe", "ignore"] },
+    );
+    const chunks = [];
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      ff.kill("SIGKILL");
+      finish(null);
+    }, 2000);
+    ff.stdout.on("data", (chunk) => chunks.push(chunk));
+    ff.on("error", () => {
+      clearTimeout(timer);
+      finish(null);
+    });
+    ff.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return finish(null);
+      const jpeg = Buffer.concat(chunks);
+      if (jpeg.length < 4 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8) return finish(null);
+      finish(jpeg);
+    });
+    ff.stdin.on("error", () => undefined);
+    ff.stdin.end(parsed.pixels);
+  });
+}
+
+function acceptWebSocket(req, socket, ctx) {
   const key = req.headers["sec-websocket-key"];
   if (!key) {
     socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
     return;
   }
+  socket.setNoDelay(true);
   const accept = crypto.createHash("sha1").update(String(key) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write(
     `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
@@ -303,21 +420,90 @@ function acceptWebSocket(req, socket) {
         continue;
       }
       if (payload[0] === 0x03) {
-        const next = touchCommand(gesture, message, size);
-        gesture = next.state;
-        if (next.command) execFile("adb", next.command, () => undefined);
+        if (ctx.motion) {
+          const command = motionCommand(message, size);
+          if (command) ctx.input.run(command);
+        } else {
+          const next = touchCommand(gesture, message, size);
+          gesture = next.state;
+          if (next.command) ctx.input.run(next.command);
+        }
       } else if (payload[0] === 0x04) {
         const command = buttonCommand(message);
-        if (command) execFile("adb", command, () => undefined);
+        if (command) ctx.input.run(command);
       } else if (payload[0] === 0x0b) {
         const command = scrollCommand(message, size);
-        if (command) execFile("adb", command, () => undefined);
+        if (command) ctx.input.run(command);
       }
     }
   });
 }
 
 function androidServe(port) {
+  const ctx = { motion: false, mode: "png", input: createInputPump() };
+  const viewers = new Set();
+  let capturing = false;
+  execFile("ffmpeg", ["-version"], (err) => {
+    ctx.mode = err ? "png" : "jpeg";
+    console.log(`android frames: ${ctx.mode}`);
+  });
+  execFile("adb", ["shell", "input", "motionevent", "CANCEL", "0", "0"], { encoding: "utf8" }, (err, stdout, stderr) => {
+    const text = `${stdout || ""}\n${stderr || ""}`;
+    ctx.motion = !err && !/unknown command/i.test(text);
+    console.log(ctx.motion ? "android touch: motionevent" : "android touch: tap/swipe");
+  });
+
+  function pngFrame() {
+    return new Promise((resolve) => {
+      execFile("adb", ["exec-out", "screencap", "-p"], { encoding: "buffer", maxBuffer: 12 * 1024 * 1024 }, (err, stdout) => {
+        const frame = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout || []);
+        if (err || frame.length < 8 || frame[0] !== 0x89) return resolve(null);
+        resolve({ body: frame, type: "image/png" });
+      });
+    });
+  }
+
+  function captureFrame() {
+    if (ctx.mode !== "jpeg") return pngFrame();
+    return new Promise((resolve) => {
+      execFile("adb", ["exec-out", "screencap"], { encoding: "buffer", maxBuffer: 24 * 1024 * 1024 }, async (err, stdout) => {
+        const raw = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout || []);
+        const parsed = !err && parseRawScreen(raw);
+        const jpeg = parsed ? await jpegFromRaw(parsed) : null;
+        if (!jpeg) {
+          ctx.mode = "png";
+          console.log("android frames: png (raw screencap unusable)");
+          resolve(await pngFrame());
+          return;
+        }
+        resolve({ body: jpeg, type: "image/jpeg" });
+      });
+    });
+  }
+
+  async function pumpFrames() {
+    if (capturing) return;
+    capturing = true;
+    while (viewers.size > 0) {
+      const frame = await captureFrame();
+      if (!frame) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        continue;
+      }
+      const head = Buffer.from(`--frame\r\nContent-Type: ${frame.type}\r\nContent-Length: ${frame.body.length}\r\n\r\n`);
+      for (const res of viewers) {
+        if (res.writableEnded) {
+          viewers.delete(res);
+          continue;
+        }
+        res.write(head);
+        res.write(frame.body);
+        res.write("\r\n");
+      }
+    }
+    capturing = false;
+  }
+
   const server = http.createServer((req, res) => {
     const path = new URL(req.url || "/", "http://localhost").pathname;
     if (path === "/health" || path === "/healthz") {
@@ -330,26 +516,17 @@ function androidServe(port) {
       res.end();
       return;
     }
+    const raw = new URL(req.url || "/", "http://localhost").searchParams.get("raw") === "1";
     res.writeHead(200, {
-      "content-type": "multipart/x-mixed-replace; boundary=frame",
-      "cache-control": "no-cache, no-store",
+      "content-type": raw ? "application/octet-stream" : "multipart/x-mixed-replace; boundary=frame",
+      "cache-control": "no-cache, no-store, no-transform",
+      "x-accel-buffering": "no",
       connection: "close",
     });
-    let inflight = false;
-    const timer = setInterval(() => {
-      if (inflight || res.writableEnded) return;
-      inflight = true;
-      execFile("adb", ["exec-out", "screencap", "-p"], { encoding: "buffer", maxBuffer: 12 * 1024 * 1024 }, (err, stdout) => {
-        inflight = false;
-        if (err || res.writableEnded) return;
-        const frame = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
-        if (frame.length < 8) return;
-        res.write(`--frame\r\nContent-Type: image/png\r\nContent-Length: ${frame.length}\r\n\r\n`);
-        res.write(frame);
-        res.write("\r\n");
-      });
-    }, 200);
-    res.on("close", () => clearInterval(timer));
+    res.socket?.setNoDelay(true);
+    viewers.add(res);
+    res.on("close", () => viewers.delete(res));
+    pumpFrames();
   });
   server.on("upgrade", (req, socket) => {
     const path = new URL(req.url || "/", "http://localhost").pathname;
@@ -357,7 +534,7 @@ function androidServe(port) {
       socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
       return;
     }
-    acceptWebSocket(req, socket);
+    acceptWebSocket(req, socket, ctx);
   });
   server.listen(Number(port), "127.0.0.1", () => console.log(`android stream on ${port}`));
 }
@@ -374,4 +551,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { touchCommand, buttonCommand, scrollCommand };
+module.exports = { touchCommand, motionCommand, parseRawScreen, buttonCommand, scrollCommand };
