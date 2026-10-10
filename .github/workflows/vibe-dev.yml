@@ -1,4 +1,4 @@
-# vibe-native-template-version: 6
+# vibe-native-template-version: 7
 # Boots a simulator or emulator and streams it until the hold loop ends.
 # Default mode is Expo Go: no native compile, JavaScript comes from the local
 # Metro tunnel. Pass mode=dev-client only when the app has custom native code.
@@ -88,8 +88,9 @@ jobs:
           echo "$UDID" > "$RUNNER_TEMP/udid"
           xcrun simctl boot "$UDID" || true
           xcrun simctl bootstatus "$UDID" -b
-          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json" || true
           touch "$RUNNER_TEMP/sim.ready"
+          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json.tmp" || true
+          mv "$RUNNER_TEMP/devices.json.tmp" "$RUNNER_TEMP/devices.json" || true
           EOF
           nohup bash "$RUNNER_TEMP/boot-sim.sh" "$DEVICE" > "$RUNNER_TEMP/boot-sim.log" 2>&1 &
 
@@ -171,7 +172,15 @@ jobs:
           fi
           UDID=$(cat "$RUNNER_TEMP/udid")
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-          echo "VIBE_DEVICES_JSON=$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/devices.json","utf8")); const names=[]; for (const rt of Object.values(j.devices||{})) for (const d of rt) if (d.isAvailable) names.push(d.name); process.stdout.write(JSON.stringify(names.slice(0,40)))')" >> "$GITHUB_ENV" || true
+          for _ in $(seq 1 20); do
+            [ -s "$RUNNER_TEMP/devices.json" ] && break
+            sleep 1
+          done
+          if [ -s "$RUNNER_TEMP/devices.json" ]; then
+            echo "VIBE_DEVICES_JSON=$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/devices.json","utf8")); const names=[]; for (const rt of Object.values(j.devices||{})) for (const d of rt) if (d.isAvailable) names.push(d.name); process.stdout.write(JSON.stringify(names.slice(0,40)))')" >> "$GITHUB_ENV" || echo 'VIBE_DEVICES_JSON=[]' >> "$GITHUB_ENV"
+          else
+            echo 'VIBE_DEVICES_JSON=[]' >> "$GITHUB_ENV"
+          fi
 
       - name: Restore stream tools
         id: tools
@@ -550,7 +559,7 @@ jobs:
             /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API }}/google_apis/x86_64
             /usr/local/lib/android/sdk/emulator
             ~/.android/avd
-          key: vibe-avd-api${{ env.ANDROID_API }}-google-x64-v1
+          key: vibe-avd-api${{ env.ANDROID_API }}-google-x64-v2
 
       - name: Start the cached emulator before checkout
         run: |
@@ -866,6 +875,13 @@ jobs:
         run: |
           set -euo pipefail
           adb emu avd snapshot save vibe-ready
+          # tar fails with "file changed as we read it" while qemu is still writing the qcow2.
+          adb emu kill >/dev/null 2>&1 || true
+          pkill -f qemu-system >/dev/null 2>&1 || true
+          for _ in $(seq 1 30); do
+            pgrep -f qemu-system >/dev/null || break
+            sleep 1
+          done
           find "$HOME/.android/avd" -name '*.lock' -delete || true
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
@@ -878,7 +894,26 @@ jobs:
             /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API }}/google_apis/x86_64
             /usr/local/lib/android/sdk/emulator
             ~/.android/avd
-          key: vibe-avd-api${{ env.ANDROID_API }}-google-x64-v1
+          key: vibe-avd-api${{ env.ANDROID_API }}-google-x64-v2
+
+      - name: Resume the cached emulator
+        if: steps.snap.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          ACCEL=off
+          [ -w /dev/kvm ] && ACCEL=on
+          nohup emulator -avd vibe -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-metrics \
+            -camera-back none -camera-front none -accel "$ACCEL" -no-snapshot-save -snapshot vibe-ready \
+            > "$RUNNER_TEMP/emulator-resume.log" 2>&1 &
+          for _ in $(seq 1 90); do
+            boot=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+            [ "$boot" = "1" ] && exit 0
+            sleep 1
+          done
+          echo "::warning::emulator did not resume from the snapshot"
+          tail -n 40 "$RUNNER_TEMP/emulator-resume.log" || true
 
       - name: Hold the stream open
         env:
