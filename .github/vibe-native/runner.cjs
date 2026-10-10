@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
+const crypto = require("node:crypto");
 const http = require("node:http");
 const https = require("node:https");
 const net = require("node:net");
@@ -199,6 +200,123 @@ function publishStatus(opts) {
   req.end(body);
 }
 
+function touchCommand(state, message, size) {
+  const x = Math.round(Number(message.x) * size.width);
+  const y = Math.round(Number(message.y) * size.height);
+  if (message.type === "begin") return { state: { x, y, endX: x, endY: y, moved: false }, command: null };
+  if (!state) return { state: null, command: null };
+  if (message.type === "move") {
+    const moved = state.moved || Math.hypot(x - state.x, y - state.y) > 8;
+    return { state: { ...state, moved, endX: x, endY: y }, command: null };
+  }
+  if (message.type !== "end") return { state, command: null };
+  const command = state.moved
+    ? ["shell", "input", "swipe", String(state.x), String(state.y), String(state.endX ?? x), String(state.endY ?? y), "180"]
+    : ["shell", "input", "tap", String(x), String(y)];
+  return { state: null, command };
+}
+
+function buttonCommand(message) {
+  if (message.phase === "up") return null;
+  const keys = { home: "3", back: "4", lock: "26", power: "26", volumeup: "24", volumedown: "25", appswitcher: "187" };
+  const key = keys[String(message.button || "").toLowerCase()];
+  return key ? ["shell", "input", "keyevent", key] : null;
+}
+
+function scrollCommand(message, size) {
+  const x = Math.round(Number(message.x) * size.width);
+  const y = Math.round(Number(message.y) * size.height);
+  const dx = Math.round(Number(message.dx) * size.width);
+  const dy = Math.round(Number(message.dy) * size.height);
+  if (!dx && !dy) return null;
+  return ["shell", "input", "swipe", String(x), String(y), String(x - dx), String(y - dy), "120"];
+}
+
+function sendWs(socket, payload) {
+  const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+  let header;
+  if (body.length < 126) header = Buffer.from([0x82, body.length]);
+  else {
+    header = Buffer.alloc(4);
+    header[0] = 0x82;
+    header[1] = 126;
+    header.writeUInt16BE(body.length, 2);
+  }
+  socket.write(header);
+  socket.write(body);
+}
+
+function acceptWebSocket(req, socket) {
+  const key = req.headers["sec-websocket-key"];
+  if (!key) {
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    return;
+  }
+  const accept = crypto.createHash("sha1").update(String(key) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+  socket.write(
+    `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+  );
+  let buffer = Buffer.alloc(0);
+  let gesture = null;
+  const size = { width: 1080, height: 2400 };
+  execFile("adb", ["shell", "wm", "size"], { encoding: "utf8" }, (_err, stdout) => {
+    const match = String(stdout || "").match(/(\d+)x(\d+)/);
+    if (match) {
+      size.width = Number(match[1]);
+      size.height = Number(match[2]);
+    }
+    sendWs(socket, Buffer.concat([Buffer.from([0x82]), Buffer.from(JSON.stringify({ width: size.width, height: size.height, orientation: "portrait" }))]));
+  });
+  socket.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length >= 2) {
+      const opcode = buffer[0] & 0x0f;
+      const length = buffer[1] & 0x7f;
+      const masked = (buffer[1] & 0x80) !== 0;
+      let header = 2;
+      if (length === 126) header = 4;
+      else if (length === 127) header = 10;
+      if (buffer.length < header) return;
+      const payloadLength = length === 126 ? buffer.readUInt16BE(2) : length === 127 ? Number(buffer.readBigUInt64BE(2)) : length;
+      const frameLength = header + (masked ? 4 : 0) + payloadLength;
+      if (buffer.length < frameLength) return;
+      const payload = Buffer.from(buffer.subarray(frameLength - payloadLength, frameLength));
+      if (masked) {
+        const mask = buffer.subarray(header, header + 4);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+      }
+      buffer = buffer.subarray(frameLength);
+      if (opcode === 0x8) {
+        socket.end();
+        return;
+      }
+      if (opcode === 0x9) {
+        socket.write(Buffer.concat([Buffer.from([0x8a, payload.length]), payload]));
+        continue;
+      }
+      if (opcode !== 0x2 && opcode !== 0x1) continue;
+      if (payload.length < 2) continue;
+      let message;
+      try {
+        message = JSON.parse(payload.subarray(1).toString("utf8"));
+      } catch {
+        continue;
+      }
+      if (payload[0] === 0x03) {
+        const next = touchCommand(gesture, message, size);
+        gesture = next.state;
+        if (next.command) execFile("adb", next.command, () => undefined);
+      } else if (payload[0] === 0x04) {
+        const command = buttonCommand(message);
+        if (command) execFile("adb", command, () => undefined);
+      } else if (payload[0] === 0x0b) {
+        const command = scrollCommand(message, size);
+        if (command) execFile("adb", command, () => undefined);
+      }
+    }
+  });
+}
+
 function androidServe(port) {
   const server = http.createServer((req, res) => {
     const path = new URL(req.url || "/", "http://localhost").pathname;
@@ -233,15 +351,27 @@ function androidServe(port) {
     }, 200);
     res.on("close", () => clearInterval(timer));
   });
+  server.on("upgrade", (req, socket) => {
+    const path = new URL(req.url || "/", "http://localhost").pathname;
+    if (path !== "/ws") {
+      socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
+      return;
+    }
+    acceptWebSocket(req, socket);
+  });
   server.listen(Number(port), "127.0.0.1", () => console.log(`android stream on ${port}`));
 }
 
-const [command] = process.argv.slice(2);
-const opts = flags(process.argv.slice(3));
-if (command === "gate") startGate(opts);
-else if (command === "publish-status") publishStatus(opts);
-else if (command === "android-serve") androidServe(opts.port || 3300);
-else {
-  console.error("usage: runner.cjs gate|publish-status|android-serve");
-  process.exit(1);
+if (require.main === module) {
+  const [command] = process.argv.slice(2);
+  const opts = flags(process.argv.slice(3));
+  if (command === "gate") startGate(opts);
+  else if (command === "publish-status") publishStatus(opts);
+  else if (command === "android-serve") androidServe(opts.port || 3300);
+  else {
+    console.error("usage: runner.cjs gate|publish-status|android-serve");
+    process.exit(1);
+  }
 }
+
+module.exports = { touchCommand, buttonCommand, scrollCommand };
