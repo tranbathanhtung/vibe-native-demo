@@ -499,8 +499,15 @@ jobs:
           echo no | avdmanager create avd -n vibe -k "$PKG" -d pixel_7 --force \
             || echo no | avdmanager create avd -n vibe -k "$PKG" --force
           set -o pipefail
-          nohup emulator -avd vibe -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot > "$RUNNER_TEMP/emulator.log" 2>&1 &
-          adb wait-for-device
+          command -v emulator
+          nohup emulator -avd vibe -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -no-metrics \
+            -accel "$([ -w /dev/kvm ] && echo on || echo off)" > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          echo "emulator pid $!"
+          if ! timeout 90 adb wait-for-device; then
+            echo "adb never saw the emulator"
+            tail -n 120 "$RUNNER_TEMP/emulator.log" || true
+            exit 1
+          fi
           for i in $(seq 1 120); do
             BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
             echo "boot check $i: ${BOOT:-waiting}"
