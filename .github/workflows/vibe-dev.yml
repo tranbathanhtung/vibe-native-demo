@@ -227,6 +227,11 @@ jobs:
           xcrun simctl launch "$UDID" host.exp.Exponent || true
           [ -n "$DEV_URL" ] || { echo "DEV_URL missing from the session secret"; exit 1; }
           xcrun simctl openurl "$UDID" "$DEV_URL"
+          # iOS asks "Open in Expo Go?" and the first launch shows the dev menu.
+          sleep 2
+          npx --yes serve-sim@0.1.47 tap -d "$UDID" 0.67 0.545 || true
+          sleep 8
+          npx --yes serve-sim@0.1.47 tap -d "$UDID" 0.50 0.90 || true
           node "$GITHUB_WORKSPACE/.github/vibe-native/runner.cjs" publish-status --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" \
             --context "$STATUS_CONTEXT" --state success --url "${{ steps.tunnel.outputs.url }}" --description "app-installed"
 
