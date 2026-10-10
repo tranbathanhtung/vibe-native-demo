@@ -1,0 +1,9 @@
+{
+  "expo": {
+    "name": "Vibe Fixture",
+    "slug": "vibe-fixture",
+    "scheme": "vibefixture",
+    "ios": { "bundleIdentifier": "app.vibe.fixture" },
+    "android": { "package": "app.vibe.fixture" }
+  }
+}
