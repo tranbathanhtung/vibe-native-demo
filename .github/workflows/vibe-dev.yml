@@ -145,13 +145,18 @@ jobs:
       - name: Start serve-sim
         run: |
           set -euo pipefail
-          # MJPEG only. /stream.avcc emits zero bytes on GitHub macOS runners.
-          # Do not pass --detach: the detached child drops --allow-any-host-when-insecure.
-          nohup npx --yes serve-sim --quiet --allow-any-host-when-insecure \
-            --port "$PREVIEW_PORT" --codec mjpeg --mjpeg-fps 30 --mjpeg-quality 0.7 --max-dimension 900 \
+          # MJPEG only. H.264 encode is unavailable on GitHub macOS runners.
+          # Do not pass --detach. serve-sim 0.1.x serves /health and rewrites
+          # the preview host itself, so the removed allow-any-host flag is not used.
+          nohup npx --yes serve-sim@0.1.47 --quiet \
+            --port "$PREVIEW_PORT" --codec mjpeg \
             > "$RUNNER_TEMP/serve-sim.json" 2> "$RUNNER_TEMP/serve-sim.log" &
-          for _ in $(seq 1 90); do
-            curl -fsS "http://127.0.0.1:$PREVIEW_PORT/readyz" >/dev/null 2>&1 && exit 0
+          for _ in $(seq 1 45); do
+            curl -fsS "http://127.0.0.1:$PREVIEW_PORT/health" >/dev/null 2>&1 && exit 0
+            if grep -q "unknown option" "$RUNNER_TEMP/serve-sim.log" 2>/dev/null; then
+              cat "$RUNNER_TEMP/serve-sim.log" >&2
+              exit 1
+            fi
             sleep 2
           done
           echo "serve-sim never became ready" >&2
