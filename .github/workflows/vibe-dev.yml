@@ -143,24 +143,29 @@ jobs:
           echo "VIBE_DEVICES_JSON=$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/devices.json","utf8")); const names=[]; for (const rt of Object.values(j.devices||{})) for (const d of rt) if (d.isAvailable) names.push(d.name); process.stdout.write(JSON.stringify(names.slice(0,40)))')" >> "$GITHUB_ENV" || true
 
       - name: Start serve-sim
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
         run: |
           set -euo pipefail
           # MJPEG only. H.264 encode is unavailable on GitHub macOS runners.
-          # Do not pass --detach. serve-sim 0.1.x serves /health and rewrites
-          # the preview host itself, so the removed allow-any-host flag is not used.
-          nohup npx --yes serve-sim@0.1.47 --quiet \
-            --port "$PREVIEW_PORT" --codec mjpeg \
-            > "$RUNNER_TEMP/serve-sim.json" 2> "$RUNNER_TEMP/serve-sim.log" &
-          for _ in $(seq 1 45); do
-            curl -fsS "http://127.0.0.1:$PREVIEW_PORT/health" >/dev/null 2>&1 && exit 0
-            if grep -q "unknown option" "$RUNNER_TEMP/serve-sim.log" 2>/dev/null; then
-              cat "$RUNNER_TEMP/serve-sim.log" >&2
+          # Do not pass --detach. Probe the device helper, not the old /readyz path.
+          nohup npx --yes serve-sim@0.1.47 --port "$PREVIEW_PORT" --codec mjpeg "$UDID" \
+            > "$RUNNER_TEMP/serve-sim.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/serve-sim.pid"
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:$PREVIEW_PORT/helper/$UDID/health" >/dev/null 2>&1; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/serve-sim.pid")" 2>/dev/null; then
+              echo "serve-sim exited" >&2
+              cat "$RUNNER_TEMP/serve-sim.log" >&2 || true
               exit 1
             fi
             sleep 2
           done
           echo "serve-sim never became ready" >&2
           cat "$RUNNER_TEMP/serve-sim.log" >&2 || true
+          curl -sv "http://127.0.0.1:$PREVIEW_PORT/" >&2 || true
           exit 1
 
       - name: Start auth gate
@@ -328,7 +333,7 @@ jobs:
           END=$(( $(date +%s) + MINUTES * 60 ))
           LAST=0
           while [ "$(date +%s)" -lt "$END" ]; do
-            curl -fsS -o /dev/null "http://127.0.0.1:$PREVIEW_PORT/healthz" || { echo "::error::serve-sim stopped"; exit 1; }
+            curl -fsS -o /dev/null "http://127.0.0.1:$PREVIEW_PORT/" || { echo "::error::serve-sim stopped"; exit 1; }
             if [ "$AGENT_ENABLED" = "true" ] && ! curl -fsS -m 10 "http://127.0.0.1:$AGENT_PORT/health" | grep -q '"ok":true'; then
               NOW=$(date +%s)
               if [ $(( NOW - LAST )) -ge 60 ]; then
