@@ -1,4 +1,4 @@
-# vibe-native-template-version: 1
+# vibe-native-template-version: 4
 name: vibe-build
 run-name: vibe-build ${{ inputs.session }} · ${{ inputs.platform }} · ${{ inputs.profile }}
 
@@ -43,10 +43,22 @@ jobs:
       IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
+      - name: Restore CocoaPods and JS caches
+        uses: actions/cache@v4
+        id: jscache
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            ~/.cocoapods
+            ${{ inputs.project_dir }}/node_modules
+            ~/.bun/install/cache
+          key: vibe-ios-${{ runner.os }}-${{ hashFiles('bun.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+          restore-keys: vibe-ios-${{ runner.os }}-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Install JS dependencies
+        if: steps.jscache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           if [ -f bun.lock ] || [ -f bun.lockb ]; then curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install --frozen-lockfile
@@ -107,6 +119,17 @@ jobs:
       ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
     steps:
       - uses: actions/checkout@v4
+      - name: Restore Gradle and JS caches
+        uses: actions/cache@v4
+        id: jscache
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ inputs.project_dir }}/node_modules
+            ~/.bun/install/cache
+          key: vibe-android-${{ runner.os }}-${{ hashFiles('bun.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+          restore-keys: vibe-android-${{ runner.os }}-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -115,6 +138,7 @@ jobs:
           distribution: temurin
           java-version: 17
       - name: Install JS dependencies
+        if: steps.jscache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           if [ -f bun.lock ] || [ -f bun.lockb ]; then curl -fsSL https://bun.sh/install | bash && export PATH="$HOME/.bun/bin:$PATH" && bun install --frozen-lockfile
@@ -139,7 +163,7 @@ jobs:
             )
           fi
           cd android
-          ./gradlew '${{ inputs.android_task }}' --no-daemon "${SIGN[@]}"
+          ./gradlew '${{ inputs.android_task }}' --no-daemon --build-cache "${SIGN[@]}"
           mkdir -p ../build/out
           find . -path '*outputs/apk/*/*.apk' -o -path '*outputs/bundle/*/*.aab' | while read -r file; do cp "$file" ../build/out/; done
       - uses: actions/upload-artifact@v4
