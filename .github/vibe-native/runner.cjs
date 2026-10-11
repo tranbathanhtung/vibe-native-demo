@@ -212,13 +212,11 @@ function publishStatus(opts) {
   req.end(body);
 }
 
-function motionCommand(message, size) {
-  const x = Math.round(Number(message.x) * size.width);
-  const y = Math.round(Number(message.y) * size.height);
-  const phase = message.type === "begin" ? "DOWN" : message.type === "move" ? "MOVE" : message.type === "end" ? "UP" : null;
-  if (!phase) return null;
-  return ["shell", "input", "motionevent", phase, String(x), String(y)];
-}
+/**
+ * `input motionevent` forgets the finger-down time when the process exits.
+ * A later MOVE or UP is a different `adb` process, so Android drops it and
+ * the screen looks frozen. A tap or swipe is one process and does land.
+ */
 
 /** Android `screencap` without `-p`: 12 or 16 byte header, then tightly packed RGBA. */
 function parseRawScreen(buffer) {
@@ -293,12 +291,11 @@ function createInputPump() {
     });
   }
   return {
+    busy() {
+      return running || queued.length > 0;
+    },
     run(argv) {
-      if (argv[3] === "MOVE") {
-        const index = queued.findIndex((item) => item[3] === "MOVE");
-        if (index >= 0) queued[index] = argv;
-        else queued.push(argv);
-      } else queued.push(argv);
+      queued.push(argv);
       drain();
     },
   };
@@ -420,14 +417,9 @@ function acceptWebSocket(req, socket, ctx) {
         continue;
       }
       if (payload[0] === 0x03) {
-        if (ctx.motion) {
-          const command = motionCommand(message, size);
-          if (command) ctx.input.run(command);
-        } else {
-          const next = touchCommand(gesture, message, size);
-          gesture = next.state;
-          if (next.command) ctx.input.run(next.command);
-        }
+        const next = touchCommand(gesture, message, size);
+        gesture = next.state;
+        if (next.command) ctx.input.run(next.command);
       } else if (payload[0] === 0x04) {
         const command = buttonCommand(message);
         if (command) ctx.input.run(command);
@@ -440,17 +432,12 @@ function acceptWebSocket(req, socket, ctx) {
 }
 
 function androidServe(port) {
-  const ctx = { motion: false, mode: "png", input: createInputPump() };
+  const ctx = { mode: "png", input: createInputPump() };
   const viewers = new Set();
   let capturing = false;
   execFile("ffmpeg", ["-version"], (err) => {
     ctx.mode = err ? "png" : "jpeg";
     console.log(`android frames: ${ctx.mode}`);
-  });
-  execFile("adb", ["shell", "input", "motionevent", "CANCEL", "0", "0"], { encoding: "utf8" }, (err, stdout, stderr) => {
-    const text = `${stdout || ""}\n${stderr || ""}`;
-    ctx.motion = !err && !/unknown command/i.test(text);
-    console.log(ctx.motion ? "android touch: motionevent" : "android touch: tap/swipe");
   });
 
   function pngFrame() {
@@ -485,6 +472,10 @@ function androidServe(port) {
     if (capturing) return;
     capturing = true;
     while (viewers.size > 0) {
+      if (ctx.input.busy()) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        continue;
+      }
       const frame = await captureFrame();
       if (!frame) {
         await new Promise((resolve) => setTimeout(resolve, 40));
@@ -551,4 +542,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { touchCommand, motionCommand, parseRawScreen, buttonCommand, scrollCommand };
+module.exports = { touchCommand, parseRawScreen, buttonCommand, scrollCommand };
