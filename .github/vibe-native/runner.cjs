@@ -301,6 +301,60 @@ function createInputPump() {
   };
 }
 
+/** Pull complete JPEGs out of an ffmpeg mjpeg pipe, including chunks that split a frame. */
+function splitJpegs(state, chunk) {
+  state.buf = state.buf.length === 0 ? chunk : Buffer.concat([state.buf, chunk]);
+  const frames = [];
+  while (state.buf.length >= 4) {
+    const start = state.buf.indexOf(Buffer.from([0xff, 0xd8]));
+    if (start < 0) {
+      state.buf = state.buf.subarray(state.buf.length - 1);
+      break;
+    }
+    const end = state.buf.indexOf(Buffer.from([0xff, 0xd9]), start + 2);
+    if (end < 0) {
+      if (start > 0) state.buf = state.buf.subarray(start);
+      break;
+    }
+    frames.push(Buffer.from(state.buf.subarray(start, end + 2)));
+    state.buf = state.buf.subarray(end + 2);
+  }
+  return frames;
+}
+
+/** One emulator encode, instead of a fresh screencap for every picture. */
+function screenRecordArgs() {
+  return ["exec-out", "screenrecord", "--output-format=h264", "--bit-rate", "2500000", "--size", "720x1280", "--time-limit", "180", "-"];
+}
+
+function ffmpegStreamArgs() {
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-fflags",
+    "nobuffer",
+    "-flags",
+    "low_delay",
+    "-probesize",
+    "32",
+    "-analyzeduration",
+    "0",
+    "-f",
+    "h264",
+    "-i",
+    "pipe:0",
+    "-an",
+    "-vf",
+    "scale=720:-2",
+    "-q:v",
+    "8",
+    "-f",
+    "mjpeg",
+    "pipe:1",
+  ];
+}
+
 function jpegFromRaw(parsed) {
   return new Promise((resolve) => {
     const ff = spawn(
@@ -468,12 +522,76 @@ function androidServe(port) {
     });
   }
 
+  function broadcast(body, type) {
+    const head = Buffer.from(`--frame\r\nContent-Type: ${type}\r\nContent-Length: ${body.length}\r\n\r\n`);
+    for (const res of viewers) {
+      if (res.writableEnded) {
+        viewers.delete(res);
+        continue;
+      }
+      res.write(head);
+      res.write(body);
+      res.write("\r\n");
+    }
+  }
+
+  let record = null;
+  let usingRecord = false;
+
+  function stopRecord() {
+    const current = record;
+    record = null;
+    if (!current) return;
+    current.adb.kill("SIGKILL");
+    current.ff.kill("SIGKILL");
+  }
+
+  function startRecord() {
+    if (record || viewers.size === 0) return;
+    const adb = spawn("adb", screenRecordArgs(), { stdio: ["ignore", "pipe", "pipe"] });
+    const ff = spawn("ffmpeg", ffmpegStreamArgs(), { stdio: ["pipe", "pipe", "ignore"] });
+    const state = { buf: Buffer.alloc(0) };
+    let closed = false;
+    const shutdown = () => {
+      if (closed) return;
+      closed = true;
+      if (record && record.adb === adb) record = null;
+      adb.kill("SIGKILL");
+      ff.kill("SIGKILL");
+      if (usingRecord && viewers.size > 0) setTimeout(startRecord, 200);
+    };
+    adb.stdout.pipe(ff.stdin);
+    ff.stdin.on("error", () => undefined);
+    ff.stdout.on("data", (chunk) => {
+      const frames = splitJpegs(state, chunk);
+      if (frames.length === 0) return;
+      usingRecord = true;
+      for (const frame of frames) broadcast(frame, "image/jpeg");
+    });
+    adb.on("close", shutdown);
+    ff.on("close", shutdown);
+    adb.on("error", shutdown);
+    ff.on("error", shutdown);
+    record = { adb, ff };
+  }
+
   async function pumpFrames() {
     if (capturing) return;
     capturing = true;
+    startRecord();
+    const started = Date.now();
     while (viewers.size > 0) {
+      if (usingRecord) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
+      if (Date.now() - started < 4000) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+      stopRecord();
       if (ctx.input.busy()) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        await new Promise((resolve) => setTimeout(resolve, 16));
         continue;
       }
       const frame = await captureFrame();
@@ -481,17 +599,10 @@ function androidServe(port) {
         await new Promise((resolve) => setTimeout(resolve, 40));
         continue;
       }
-      const head = Buffer.from(`--frame\r\nContent-Type: ${frame.type}\r\nContent-Length: ${frame.body.length}\r\n\r\n`);
-      for (const res of viewers) {
-        if (res.writableEnded) {
-          viewers.delete(res);
-          continue;
-        }
-        res.write(head);
-        res.write(frame.body);
-        res.write("\r\n");
-      }
+      broadcast(frame.body, frame.type);
     }
+    stopRecord();
+    usingRecord = false;
     capturing = false;
   }
 
@@ -542,4 +653,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { touchCommand, parseRawScreen, buttonCommand, scrollCommand };
+module.exports = { touchCommand, parseRawScreen, buttonCommand, scrollCommand, splitJpegs, screenRecordArgs, ffmpegStreamArgs };
