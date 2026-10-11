@@ -3,11 +3,11 @@
   "private": true,
   "main": "index.ts",
   "dependencies": {
-    "@types/react": "~19.1.10",
-    "expo": "~54.0.0",
-    "expo-haptics": "~15.0.8",
-    "react": "19.1.0",
-    "react-native": "0.81.4",
+    "@expo/ui": "~56.0.26",
+    "@types/react": "~19.2.0",
+    "expo": "~56.0.23",
+    "react": "19.2.3",
+    "react-native": "0.85.3",
     "typescript": "~5.9.2"
   }
 }
