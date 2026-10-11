@@ -251,15 +251,15 @@ jobs:
           UDID: ${{ steps.sim.outputs.udid }}
         run: |
           set -euo pipefail
-          # MJPEG only. H.264 encode is unavailable on GitHub macOS runners.
-          # Do not pass --detach. Probe the device helper, not the old /readyz path.
+          # auto uses the simulator's H.264 encoder. Software JPEG stays the fallback
+          # when the browser cannot decode it. Do not pass --detach.
           for _ in $(seq 1 180); do
             [ -x "$RUNNER_TEMP/serve-sim/node_modules/.bin/serve-sim" ] && [ -f "$RUNNER_TEMP/serve-sim.ready" ] && break
             sleep 1
           done
           SIM="$RUNNER_TEMP/serve-sim/node_modules/.bin/serve-sim"
           [ -x "$SIM" ] || { echo "serve-sim install failed" >&2; cat "$RUNNER_TEMP/fetch-ios-tools.log" >&2 || true; exit 1; }
-          nohup "$SIM" --port "$PREVIEW_PORT" --codec mjpeg "$UDID" \
+          nohup "$SIM" --port "$PREVIEW_PORT" --codec auto "$UDID" \
             > "$RUNNER_TEMP/serve-sim.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/serve-sim.pid"
           for _ in $(seq 1 60); do
