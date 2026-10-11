@@ -1,4 +1,4 @@
-# vibe-native-template-version: 7
+# vibe-native-template-version: 8
 # Boots a simulator or emulator and streams it until the hold loop ends.
 # Default mode is Expo Go: no native compile, JavaScript comes from the local
 # Metro tunnel. Pass mode=dev-client only when the app has custom native code.
@@ -195,7 +195,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.vibe-native/expo-go
-          key: vibe-ios-expogo-${{ runner.os }}-v1
+          key: vibe-ios-expogo-${{ runner.os }}-v2
 
       - name: Prepare stream tools
         env:
@@ -445,7 +445,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.vibe-native/expo-go
-          key: vibe-ios-expogo-${{ runner.os }}-v1
+          key: vibe-ios-expogo-${{ runner.os }}-v2
 
       - name: Hold the stream open
         env:
